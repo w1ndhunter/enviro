@@ -91,7 +91,7 @@ def check_trigger():
 
   last_rain_trigger = rain_sensor_trigger
 
-def wind_speed(sample_time_ms=10000):
+def wind_speed(sample_time_ms=40000):
   # get initial sensor state
   state = wind_speed_pin.value()
 
@@ -124,7 +124,7 @@ def wind_speed(sample_time_ms=10000):
 
   # calculate the average, min and max tick between transitions in ms
   average_tick_ms = (time.ticks_diff(ticks[-1], ticks[0])) / (len(ticks) - 1)
-  min_tick_ms = 10000
+  min_tick_ms = 40000
   max_tick_ms = 0
   for i in range(1, len(ticks)):
     tick_diff = time.ticks_diff(ticks[i], ticks[i-1])
@@ -163,24 +163,37 @@ def wind_speed(sample_time_ms=10000):
   return avg_wind_m_s, max_wind_m_s, min_wind_m_s
 
 def wind_direction():
-    REFERENCE_VOLTAGE = 3.0  # Reference voltage that corresponds to 90 degrees
-    
-    # Read voltage with basic debouncing
-    last_value = None
-    while True:
-        value = wind_direction_pin.read_voltage()
-        
-        if last_value is not None and abs(value - last_value) < 0.1:  # Debouncing threshold
-            break
-        last_value = value
-    
-    # Convert voltage to degrees: (voltage / 3.0V) * 90° to get the proper scaling
-    degree = (value / REFERENCE_VOLTAGE) * 90
-    
-    # Ensure the value stays within 0-360 range
-    degree = degree % 360
-    
-    return round(degree, 1)
+  # adc reading voltage to cardinal direction taken from our python
+  # library - each array index represents a 45 degree step around
+  # the compass (index 0 == 0, 1 == 45, 2 == 90, etc.)
+  # we find the closest matching value in the array and use the index
+  # to determine the heading
+  ADC_TO_DEGREES = (0.9, 2.0, 3.0, 2.8, 2.5, 1.5, 0.3, 0.6)
+
+  closest_index = -1
+  last_index = None
+
+  # ensure we have two readings that match in a row as otherwise if
+  # you read during transition between two values it can glitch
+  # fixes https://github.com/pimoroni/enviro/issues/20
+  while True:
+    value = wind_direction_pin.read_voltage()
+
+    closest_index = -1
+    closest_value = float('inf')
+
+    for i in range(8):
+      distance = abs(ADC_TO_DEGREES[i] - value)
+      if distance < closest_value:
+        closest_value = distance
+        closest_index = i
+
+    if last_index == closest_index:
+      break
+
+    last_index = closest_index
+
+  return closest_index * 45
 
 def rainfall(seconds_since_last):
   amount = 0
