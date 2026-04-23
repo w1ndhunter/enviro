@@ -17,6 +17,22 @@ WIND_CM_RADIUS = 7.0
 # scaling factor for wind speed in m/s
 WIND_FACTOR = 0.0218
 
+# debounce threshold for spurious, too-fast tick intervals (ms)
+# values below this are treated as contact bounce/noise rather than real rotations
+WIND_BOUNCE_MS = 5
+
+# hard cap for physically plausible wind speeds (m/s) to reject spikes
+WIND_MAX_M_S_CAP = 75.0
+
+# default averaging window for wind direction (ms)
+WIND_DIRECTION_AVG_WINDOW_MS = 5000
+
+# average fastest N intervals for gust to reduce single-sample spikes
+WIND_GUST_FASTEST_SAMPLES = 3
+
+# minimum normalized resultant vector length for direction average confidence
+WIND_DIRECTION_MIN_RESULTANT = 0.2
+
 bme280 = BreakoutBME280(i2c, 0x77)
 ltr559 = BreakoutLTR559(i2c)
 
@@ -122,45 +138,171 @@ def wind_speed(sample_time_ms=40000):
   if len(ticks) < 2:
     return 0, 0, 0
 
-  # calculate the average, min and max tick between transitions in ms
-  average_tick_ms = (time.ticks_diff(ticks[-1], ticks[0])) / (len(ticks) - 1)
-  min_tick_ms = 40000
-  max_tick_ms = 0
+  # build list of intervals between ticks (ms)
+  tick_diffs = []
   for i in range(1, len(ticks)):
-    tick_diff = time.ticks_diff(ticks[i], ticks[i-1])
-    max_tick_ms = max(max_tick_ms, tick_diff)
-    if max_tick_ms > 0:
-      min_tick_ms_tmp = min(min_tick_ms, tick_diff)
-      if min_tick_ms_tmp > 0:
-        min_tick_ms = min_tick_ms_tmp
+    diff = time.ticks_diff(ticks[i], ticks[i-1])
+    if diff > 0:
+      tick_diffs.append(diff)
+
+  # debounce: drop unphysically small intervals likely caused by contact bounce
+  tick_diffs = [d for d in tick_diffs if d >= WIND_BOUNCE_MS]
+
+  if not tick_diffs:
+    return 0, 0, 0
+
+  # calculate average, min, and max intervals
+  average_tick_ms = sum(tick_diffs) / len(tick_diffs)
+  min_tick_ms = min(tick_diffs)
+  max_tick_ms = max(tick_diffs)
 
   logging.info(f"average_tick_ms: {average_tick_ms}")
   logging.info(f"min_tick_ms: {min_tick_ms}")
   logging.info(f"max_tick_ms: {max_tick_ms}")
 
-  # Handle cases where individual values are 0
-  avg_wind_m_s = min_wind_m_s = max_wind_m_s = 0
-  
-  if average_tick_ms == 0 and max_tick_ms == 0:
-    return 0, 0, 0
-    
-  # Calculate only for non-zero values
-  if average_tick_ms != 0:
+  # compute wind speeds from intervals
+  avg_wind_m_s = 0
+  max_wind_m_s = 0
+  min_wind_m_s = 0
+
+  circumference = WIND_CM_RADIUS * 2.0 * math.pi
+
+  if average_tick_ms > 0:
     avg_rotation_hz = (1000 / average_tick_ms) / 2
-    circumference = WIND_CM_RADIUS * 2.0 * math.pi
     avg_wind_m_s = avg_rotation_hz * circumference * WIND_FACTOR
-    
-  if min_tick_ms != 0:
+
+  if min_tick_ms > 0:
     max_rotation_hz = (1000 / min_tick_ms) / 2
-    circumference = WIND_CM_RADIUS * 2.0 * math.pi
     max_wind_m_s = max_rotation_hz * circumference * WIND_FACTOR
-    
-  if max_tick_ms != 0:
+
+  if max_tick_ms > 0:
     min_rotation_hz = (1000 / max_tick_ms) / 2
-    circumference = WIND_CM_RADIUS * 2.0 * math.pi
     min_wind_m_s = min_rotation_hz * circumference * WIND_FACTOR
 
+  # clamp unrealistic spikes
+  if max_wind_m_s > WIND_MAX_M_S_CAP:
+    max_wind_m_s = WIND_MAX_M_S_CAP
+
   return avg_wind_m_s, max_wind_m_s, min_wind_m_s
+
+def wind_speed_and_direction_avg(sample_time_ms=40000, dir_sample_interval_ms=25):
+  # measure wind speed ticks and accumulate direction vector average in the same window
+  state = wind_speed_pin.value()
+
+  ticks = []
+
+  sum_x = 0.0
+  sum_y = 0.0
+  dir_samples = 0
+
+  def averaged_direction_degrees():
+    if dir_samples == 0:
+      return wind_direction()
+
+    resultant = math.sqrt((sum_x * sum_x) + (sum_y * sum_y)) / dir_samples
+    if resultant < WIND_DIRECTION_MIN_RESULTANT:
+      logging.warn(
+        f"! wind direction average unstable (resultant={resultant}), "
+        "falling back to stabilized instant direction"
+      )
+      return wind_direction()
+
+    avg_rad = math.atan2(sum_y, sum_x)
+    avg_dir_deg = math.degrees(avg_rad)
+    if avg_dir_deg < 0:
+      avg_dir_deg += 360.0
+    return int(((avg_dir_deg + 22.5) // 45) % 8) * 45
+
+  # helper for voltage -> discrete 45° step
+  ADC_TO_DEGREES = (0.9, 2.0, 3.0, 2.8, 2.5, 1.5, 0.3, 0.6)
+  def voltage_to_degrees(value):
+    closest_index = -1
+    closest_value = float('inf')
+    for i in range(8):
+      distance = abs(ADC_TO_DEGREES[i] - value)
+      if distance < closest_value:
+        closest_value = distance
+        closest_index = i
+    return closest_index * 45
+
+  start = time.ticks_ms()
+  next_dir_sample_at = start
+  while time.ticks_diff(time.ticks_ms(), start) <= sample_time_ms:
+    now_state = wind_speed_pin.value()
+    if now_state != state:
+      ticks.append(time.ticks_ms())
+      state = now_state
+
+    now_ms = time.ticks_ms()
+    if time.ticks_diff(now_ms, next_dir_sample_at) >= 0:
+      angle_deg = voltage_to_degrees(wind_direction_pin.read_voltage())
+      rad = math.radians(angle_deg)
+      sum_x += math.cos(rad)
+      sum_y += math.sin(rad)
+      dir_samples += 1
+      next_dir_sample_at = time.ticks_add(next_dir_sample_at, dir_sample_interval_ms)
+
+  logging.info(f"ticks: {ticks}")
+
+  # Filter out duplicate ticks that may occur due to noise/bouncing
+  filtered_ticks = []
+  for tick in ticks:
+    if not filtered_ticks or tick != filtered_ticks[-1]:
+      filtered_ticks.append(tick)
+  ticks = filtered_ticks
+
+  logging.info(f"filtered_ticks: {filtered_ticks}")
+
+  if len(ticks) < 2:
+    # no speed, still return averaged direction if we have it
+    return 0, 0, 0, averaged_direction_degrees()
+
+  # intervals between ticks with debounce
+  tick_diffs = []
+  for i in range(1, len(ticks)):
+    diff = time.ticks_diff(ticks[i], ticks[i-1])
+    if diff > 0:
+      tick_diffs.append(diff)
+  tick_diffs = [d for d in tick_diffs if d >= WIND_BOUNCE_MS]
+  if not tick_diffs:
+    return 0, 0, 0, averaged_direction_degrees()
+
+  average_tick_ms = sum(tick_diffs) / len(tick_diffs)
+  min_tick_ms = min(tick_diffs)
+  max_tick_ms = max(tick_diffs)
+
+  logging.info(f"average_tick_ms: {average_tick_ms}")
+  logging.info(f"min_tick_ms: {min_tick_ms}")
+  logging.info(f"max_tick_ms: {max_tick_ms}")
+
+  circumference = WIND_CM_RADIUS * 2.0 * math.pi
+
+  avg_wind_m_s = 0
+  max_wind_m_s = 0
+  min_wind_m_s = 0
+
+  if average_tick_ms > 0:
+    avg_rotation_hz = (1000 / average_tick_ms) / 2
+    avg_wind_m_s = avg_rotation_hz * circumference * WIND_FACTOR
+
+  gust_tick_ms = min_tick_ms
+  if len(tick_diffs) > 1:
+    sorted_tick_diffs = sorted(tick_diffs)
+    fastest_sample_count = min(WIND_GUST_FASTEST_SAMPLES, len(sorted_tick_diffs))
+    gust_tick_ms = sum(sorted_tick_diffs[:fastest_sample_count]) / fastest_sample_count
+
+  if gust_tick_ms > 0:
+    max_rotation_hz = (1000 / gust_tick_ms) / 2
+    max_wind_m_s = max_rotation_hz * circumference * WIND_FACTOR
+
+  if max_tick_ms > 0:
+    min_rotation_hz = (1000 / max_tick_ms) / 2
+    min_wind_m_s = min_rotation_hz * circumference * WIND_FACTOR
+
+  if max_wind_m_s > WIND_MAX_M_S_CAP:
+    max_wind_m_s = WIND_MAX_M_S_CAP
+
+  return avg_wind_m_s, max_wind_m_s, min_wind_m_s, averaged_direction_degrees()
 
 def wind_direction():
   # adc reading voltage to cardinal direction taken from our python
@@ -170,18 +312,20 @@ def wind_direction():
   # to determine the heading
   ADC_TO_DEGREES = (0.9, 2.0, 3.0, 2.8, 2.5, 1.5, 0.3, 0.6)
 
-  closest_index = -1
-  last_index = None
+  # require two matching samples in a row to avoid glitching mid-transition
+  # (fixes https://github.com/pimoroni/enviro/issues/20). Cap attempts so a
+  # noisy or disconnected vane cannot hang the board forever.
+  MAX_ATTEMPTS = 10
+  SAMPLE_DELAY_MS = 5
 
-  # ensure we have two readings that match in a row as otherwise if
-  # you read during transition between two values it can glitch
-  # fixes https://github.com/pimoroni/enviro/issues/20
-  while True:
+  last_index = None
+  closest_index = -1
+
+  for _ in range(MAX_ATTEMPTS):
     value = wind_direction_pin.read_voltage()
 
     closest_index = -1
     closest_value = float('inf')
-
     for i in range(8):
       distance = abs(ADC_TO_DEGREES[i] - value)
       if distance < closest_value:
@@ -189,10 +333,12 @@ def wind_direction():
         closest_index = i
 
     if last_index == closest_index:
-      break
+      return closest_index * 45
 
     last_index = closest_index
+    time.sleep_ms(SAMPLE_DELAY_MS)
 
+  logging.warn(f"! wind_direction did not stabilise after {MAX_ATTEMPTS} samples, returning last value {closest_index * 45}")
   return closest_index * 45
 
 def rainfall(seconds_since_last):
@@ -226,7 +372,7 @@ def get_sensor_readings(seconds_since_last, is_usb_power):
 
   ltr_data = ltr559.get_reading()
   rain, rain_per_second = rainfall(seconds_since_last)
-  avg_wind_speed, max_wind_speed, min_wind_speed = wind_speed()
+  avg_wind_speed, max_wind_speed, min_wind_speed, avg_wind_direction = wind_speed_and_direction_avg(sample_time_ms=WIND_DIRECTION_AVG_WINDOW_MS)
 
   from ucollections import OrderedDict
   return OrderedDict({
@@ -239,5 +385,5 @@ def get_sensor_readings(seconds_since_last, is_usb_power):
     "max_wind_speed": max_wind_speed,
     "rain": rain,
     "rain_per_second": rain_per_second,
-    "wind_direction": wind_direction()
+    "wind_direction": avg_wind_direction,
   })
