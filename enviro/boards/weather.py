@@ -33,6 +33,40 @@ WIND_GUST_FASTEST_SAMPLES = 3
 # minimum normalized resultant vector length for direction average confidence
 WIND_DIRECTION_MIN_RESULTANT = 0.2
 
+
+def _wind_direction_resultant_from_bins(bin_indices):
+  """Mean resultant length (0..1) for discrete 45° sector indices 0..7."""
+  if not bin_indices:
+    return 0.0
+  n = len(bin_indices)
+  sum_x = 0.0
+  sum_y = 0.0
+  for i in bin_indices:
+    rad = math.radians(i * 45)
+    sum_x += math.cos(rad)
+    sum_y += math.sin(rad)
+  return math.sqrt((sum_x * sum_x) + (sum_y * sum_y)) / n
+
+
+def _circular_median_bin(bin_indices):
+  """Circular median on the 8-sector ring: minimizes sum of shortest arc distances in steps."""
+  if not bin_indices:
+    return 0
+  best_cost = None
+  best_ks = None
+  for k in range(8):
+    cost = 0
+    for i in bin_indices:
+      d = abs(i - k)
+      cost += min(d, 8 - d)
+    if best_cost is None or cost < best_cost:
+      best_cost = cost
+      best_ks = [k]
+    elif cost == best_cost:
+      best_ks.append(k)
+  return min(best_ks, key=lambda kb: (-bin_indices.count(kb), kb))
+
+
 bme280 = BreakoutBME280(i2c, 0x77)
 ltr559 = BreakoutLTR559(i2c)
 
@@ -191,15 +225,13 @@ def wind_speed_and_direction_avg(sample_time_ms=40000, dir_sample_interval_ms=25
 
   ticks = []
 
-  sum_x = 0.0
-  sum_y = 0.0
-  dir_samples = 0
+  dir_bin_indices = []
 
   def averaged_direction_degrees():
-    if dir_samples == 0:
+    if not dir_bin_indices:
       return wind_direction()
 
-    resultant = math.sqrt((sum_x * sum_x) + (sum_y * sum_y)) / dir_samples
+    resultant = _wind_direction_resultant_from_bins(dir_bin_indices)
     if resultant < WIND_DIRECTION_MIN_RESULTANT:
       logging.warn(
         f"! wind direction average unstable (resultant={resultant}), "
@@ -207,11 +239,7 @@ def wind_speed_and_direction_avg(sample_time_ms=40000, dir_sample_interval_ms=25
       )
       return wind_direction()
 
-    avg_rad = math.atan2(sum_y, sum_x)
-    avg_dir_deg = math.degrees(avg_rad)
-    if avg_dir_deg < 0:
-      avg_dir_deg += 360.0
-    return int(((avg_dir_deg + 22.5) // 45) % 8) * 45
+    return _circular_median_bin(dir_bin_indices) * 45
 
   # helper for voltage -> discrete 45° step
   ADC_TO_DEGREES = (0.9, 2.0, 3.0, 2.8, 2.5, 1.5, 0.3, 0.6)
@@ -236,10 +264,7 @@ def wind_speed_and_direction_avg(sample_time_ms=40000, dir_sample_interval_ms=25
     now_ms = time.ticks_ms()
     if time.ticks_diff(now_ms, next_dir_sample_at) >= 0:
       angle_deg = voltage_to_degrees(wind_direction_pin.read_voltage())
-      rad = math.radians(angle_deg)
-      sum_x += math.cos(rad)
-      sum_y += math.sin(rad)
-      dir_samples += 1
+      dir_bin_indices.append(int(angle_deg // 45) % 8)
       next_dir_sample_at = time.ticks_add(next_dir_sample_at, dir_sample_interval_ms)
 
   logging.info(f"ticks: {ticks}")
